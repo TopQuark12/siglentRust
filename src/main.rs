@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     
     let mut scope = Sds::new("192.168.1.91:5025", 12).unwrap();
+    // let mut scope = Sds::new("192.168.1.12:5025", 8).unwrap();
     info!("{:?}", scope.query("*IDN?\n").unwrap());
 
     let (samples, _points, wave_info) = scope.get_samples("C1").unwrap();
@@ -28,9 +29,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     root_drawing_area.fill(&WHITE).unwrap();
 
     let mut chart = ChartBuilder::on(&root_drawing_area)
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(30)
         .build_cartesian_2d(wave_info.t_min..wave_info.t_max, wave_info.v_min..wave_info.v_max)
         .unwrap();
-
+        
+    chart.configure_mesh().draw()?;
+    chart.configure_series_labels().draw()?;
+    chart.configure_mesh().draw()?;
     chart.draw_series(LineSeries::new(samples, &RED))?;
 
     root_drawing_area.present()?;

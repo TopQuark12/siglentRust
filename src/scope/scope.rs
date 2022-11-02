@@ -61,10 +61,14 @@ impl Sds {
     pub fn get_wave_parameter(&mut self) -> Result<(f32, f32, f32, f32)> {
         let raw_waveform_settings = self.query_raw(":WAVeform:PREamble?\n")?;
         let volt_per_div = f32::from_le_bytes(raw_waveform_settings[156+11..160+11].try_into().unwrap());
+        info!("{:?}", volt_per_div);
         let vert_offset = f32::from_le_bytes(raw_waveform_settings[160+11..164+11].try_into().unwrap());
+        info!("{:?}", vert_offset);
         let lsb_per_div = f32::from_le_bytes(raw_waveform_settings[164+11..168+11].try_into().unwrap());
+        info!("{:?}", lsb_per_div);
         let probe_atten = f32::from_le_bytes(raw_waveform_settings[328+11..332+11].try_into().unwrap());
-        let volt_per_lsb = volt_per_div / lsb_per_div / probe_atten;    
+        info!("{:?}", probe_atten);
+        let volt_per_lsb = volt_per_div / lsb_per_div * probe_atten;    
         let sample_interval = f32::from_le_bytes(raw_waveform_settings[176+11..180+11].try_into().unwrap());
         Ok((volt_per_lsb, vert_offset, sample_interval, lsb_per_div * 8.0))
     }
@@ -93,8 +97,8 @@ impl Sds {
         let info = WaveInfo {
             t_max: sample_interval * sample_points as f32,
             t_min: 0.0,
-            v_max: vert_offset + volt_per_lsb * vert_bits / 2.0,
-            v_min: vert_offset - volt_per_lsb * vert_bits / 2.0,
+            v_max:   volt_per_lsb * vert_bits / 2.0 + vert_offset,
+            v_min: - volt_per_lsb * vert_bits / 2.0 + vert_offset,
         };
         for transfer_cnt in 0..num_transfer_req {
             let mut transfer_buf: Vec<u8> = Vec::with_capacity(bytes_to_receive + 1024);
@@ -110,13 +114,12 @@ impl Sds {
                 let mut parser = Cursor::new(transfer_buf);
                 for i in 0..samples_to_receive {                         
                     let word: i16 = parser.read_i16::<LittleEndian>().unwrap();
-                    let v = word as f32 * volt_per_lsb + vert_offset;
+                    let v = word as f32 * volt_per_lsb;
                     samples.push(((i + samples_to_receive * transfer_cnt) as f32 * sample_interval, v));
                 }
             } else {
                 for i in 0..samples_to_receive {
-                    let byte : Vec<u8> = transfer_buf.drain(0..1).collect();
-                    let v = (byte[0] as i8) as f32 * volt_per_lsb + vert_offset;
+                    let v = (transfer_buf[i] as i8) as f32 * volt_per_lsb;
                     samples.push(((i + samples_to_receive * transfer_cnt) as f32 * sample_interval, v));
                 }
             }
