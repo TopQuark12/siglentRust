@@ -10,3 +10,11 @@ fugit = "0.3.6"
 nom = "7.1.1"
 byteorder = "1.4.3"
 plotters = "0.3.1"
+rayon = "1.5.3"
+realfft = { git = "https://github.com/HEnquist/realfft.git", branch = "master" }
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = true
+panic = "abort"

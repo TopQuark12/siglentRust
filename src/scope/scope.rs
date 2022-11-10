@@ -3,14 +3,20 @@ use std::intrinsics::size_of;
 use std::io::ErrorKind;
 use std::net::*;
 use std::str;
-use std::io::Cursor;
 use std::io::prelude::*;
 use std::io::{Result, Error};
 use log::*;
 use byteorder::*;
 use nom::number::complete::float;
+use rayon::prelude::*;
 
-const RX_BUF_SIZE: usize = 4096;
+use fugit::*;
+use std::{thread, time};
+fn sleep (millis : MillisDurationU64) {
+    thread::sleep(time::Duration::from_millis(millis.to_millis()));
+}
+
+const RX_BUF_SIZE: usize = 1024;
 
 pub struct WaveInfo {
     pub t_max: f32,
@@ -41,8 +47,19 @@ impl Sds {
         Ok(())
     }
 
-    pub fn read(&mut self) -> Result<&[u8]>{
+    pub fn read_raw(&mut self) -> Result<&[u8]>{
         self.stream.read(&mut self.rx_buf).and_then(|len| {self.rx_len = len; Ok(&self.rx_buf[0..len])})
+    }
+
+    pub fn read(&mut self) -> Result<&[u8]>{
+        // self.stream.read(&mut self.rx_buf).and_then(|len| {self.rx_len = len; Ok(&self.rx_buf[0..len])})
+        self.rx_len = 0;
+        self.rx_buf.fill(0_u8);
+        while {
+            self.stream.read(&mut self.rx_buf[self.rx_len..]).and_then(|len| {self.rx_len += len; Ok(&self.rx_buf[0..len])}).unwrap();
+            !self.rx_buf.contains(&10)
+        } {}
+        Ok(&self.rx_buf[0..self.rx_len])
     }
 
     pub fn query_raw(&mut self, command: &str) -> Result<&[u8]> {
@@ -52,6 +69,7 @@ impl Sds {
 
     pub fn query(&mut self, command: &str) -> Result<&str> {
         self.query_raw(command)?;
+        info!("{:?}", str::from_utf8(&self.rx_buf[0..self.rx_len]));
         match str::from_utf8(&self.rx_buf[0..self.rx_len]) {
             Ok(msg) => Ok(msg),
             Err(e) => Err(Error::new(ErrorKind::InvalidData, e))
@@ -60,20 +78,18 @@ impl Sds {
 
     pub fn get_wave_parameter(&mut self) -> Result<(f32, f32, f32, f32)> {
         let raw_waveform_settings = self.query_raw(":WAVeform:PREamble?\n")?;
-        let volt_per_div = f32::from_le_bytes(raw_waveform_settings[156+11..160+11].try_into().unwrap());
-        info!("{:?}", volt_per_div);
-        let vert_offset = f32::from_le_bytes(raw_waveform_settings[160+11..164+11].try_into().unwrap());
-        info!("{:?}", vert_offset);
-        let lsb_per_div = f32::from_le_bytes(raw_waveform_settings[164+11..168+11].try_into().unwrap());
-        info!("{:?}", lsb_per_div);
-        let probe_atten = f32::from_le_bytes(raw_waveform_settings[328+11..332+11].try_into().unwrap());
-        info!("{:?}", probe_atten);
+        let waveform_settings = raw_waveform_settings.split(|x| x == &b'#').nth(1).unwrap();
+        info!("raw {:?}", waveform_settings);
+        let volt_per_div = f32::from_le_bytes(waveform_settings[156+10..160+10].try_into().unwrap());
+        let vert_offset = f32::from_le_bytes(waveform_settings[160+10..164+10].try_into().unwrap());
+        let lsb_per_div = f32::from_le_bytes(waveform_settings[164+10..168+10].try_into().unwrap());
+        let probe_atten = f32::from_le_bytes(waveform_settings[328+10..332+10].try_into().unwrap());
         let volt_per_lsb = volt_per_div / lsb_per_div * probe_atten;    
-        let sample_interval = f32::from_le_bytes(raw_waveform_settings[176+11..180+11].try_into().unwrap());
+        let sample_interval = f32::from_le_bytes(waveform_settings[176+10..180+10].try_into().unwrap());
         Ok((volt_per_lsb, vert_offset, sample_interval, lsb_per_div * 8.0))
     }
 
-    pub fn get_samples(&mut self, ch: &str) -> Result<(Vec<(f32, f32)>, usize, WaveInfo)> {
+    pub fn get_samples(&mut self, ch: &str) -> Result<((Vec<f32>, Vec<f32>), usize, WaveInfo)> {
 
         if self.bits > 8 {
             self.write(":WAVeform:WIDTh WORD\n")?;
@@ -82,7 +98,9 @@ impl Sds {
         }
 
         self.write(&*format!(":WAVeform:SOURce {}\n", ch))?;
-        let (volt_per_lsb, vert_offset, sample_interval, vert_bits) = self.get_wave_parameter()?;    
+        let (volt_per_lsb, vert_offset, sample_interval, vert_bits) = self.get_wave_parameter()?;   
+        info!("got wave param {} {} {} {}", volt_per_lsb, vert_offset, sample_interval, vert_bits);
+        let _ = self.query(":ACQuire:POINts?\n").unwrap();
         let sample_points = float::<_, ()>(self.query(":ACQuire:POINts?\n")?).unwrap().1 as usize;
         let max_point_transfer = float::<_, ()>(self.query(":WAV:MAXPoint?\n")?).unwrap().1 as usize;
         let num_transfer_req = ((sample_points + max_point_transfer - 1) / max_point_transfer) as usize;
@@ -93,7 +111,8 @@ impl Sds {
         info!("max tx {}", max_point_transfer);
         info!("tx needed {}", num_transfer_req);
         info!("bytes to receive {:?}", bytes_to_receive);
-        let mut samples: Vec<(f32, f32)> = Vec::with_capacity(sample_points * size_of::<f32>() * 2);
+        let mut v_samples: Vec<f32> = Vec::with_capacity(sample_points * size_of::<f32>());
+        let mut t_samples: Vec<f32> = Vec::with_capacity(sample_points * size_of::<f32>());
         let info = WaveInfo {
             t_max: sample_interval * sample_points as f32,
             t_min: 0.0,
@@ -106,22 +125,20 @@ impl Sds {
             self.write(":WAVeform:DATA?\n")?;
             let mut bytes_received = 0;
             while bytes_received < bytes_to_receive {
-                transfer_buf.extend_from_slice(self.read().unwrap());
+                transfer_buf.extend_from_slice(self.read_raw().unwrap());
                 bytes_received += self.rx_len;
             }
+            info!("{:?} bytes received", bytes_received);
             let _: Vec<_>= transfer_buf.drain(0..11).collect();
             if self.bits > 8 {
-                let mut parser = Cursor::new(transfer_buf);
-                for i in 0..samples_to_receive {                         
-                    let word: i16 = parser.read_i16::<LittleEndian>().unwrap();
-                    let v = word as f32 * volt_per_lsb;
-                    samples.push(((i + samples_to_receive * transfer_cnt) as f32 * sample_interval, v));
-                }
+                v_samples.extend::<Vec<f32>>(transfer_buf.par_chunks(2).map(|x|{LittleEndian::read_i16(x) as f32 * volt_per_lsb}).collect());
+                t_samples.extend::<Vec<f32>>((samples_to_receive * transfer_cnt..samples_to_receive * transfer_cnt + samples_to_receive)
+                                                .into_par_iter().map(|x| x as f32 * sample_interval).collect());
+                            
             } else {
-                for i in 0..samples_to_receive {
-                    let v = (transfer_buf[i] as i8) as f32 * volt_per_lsb;
-                    samples.push(((i + samples_to_receive * transfer_cnt) as f32 * sample_interval, v));
-                }
+                v_samples.extend::<Vec<f32>>(transfer_buf.into_par_iter().map(|x| (x as i8) as f32 * volt_per_lsb).collect());
+                t_samples.extend::<Vec<f32>>((samples_to_receive * transfer_cnt..samples_to_receive * transfer_cnt + samples_to_receive)
+                                                .into_par_iter().map(|x| x as f32 * sample_interval).collect());
             }
 
         }
@@ -131,7 +148,10 @@ impl Sds {
         info!("tmax {:?}", info.t_max);
         info!("tmin {:?}", info.t_min);
 
-        Ok((samples, samples_to_receive, info))
+        v_samples.pop();
+        t_samples.pop();
+
+        Ok(((v_samples, t_samples), sample_points, info))
 
     }
 
